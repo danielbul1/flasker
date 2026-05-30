@@ -386,10 +386,10 @@ def plot_cone_day(excursion_df: pd.DataFrame,
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run(symbol: str = "ES=F",
-        interval: str = "5m",
-        period: str = "60d",
+        interval: str = "1h",
+        period: str = "730d",
         csv_path: str | None = None,
-        n_range: range = range(2, 31),
+        n_range: range = range(2, 61),
         thresholds: list[float] = None,
         exclude_macro: bool = True) -> dict:
 
