@@ -88,8 +88,13 @@ def load_data(symbol: str = "ES=F",
               interval: str = "1h",
               csv_path: str | None = None) -> pd.DataFrame:
     """
-    Load hourly data and convert index to America/New_York.
-    Returns DataFrame with columns: open, high, low, close, volume, date, hour.
+    Load intraday data and convert index to America/New_York.
+    Works for any interval (1m, 5m, 15m, 30m, 1h).
+    yfinance limits: 5m/15m/30m → max 60d; 1h → max 730d.
+
+    Returns DataFrame with columns: open, high, low, close, volume,
+                                    date, hour, minute, time_bucket.
+    time_bucket = minutes from midnight (resolution-agnostic bucket key).
     """
     if csv_path:
         df = pd.read_csv(csv_path, parse_dates=["Datetime"], index_col="Datetime")
@@ -108,8 +113,10 @@ def load_data(symbol: str = "ES=F",
     df.columns = [c.lower() for c in df.columns]
     df = df[["open", "high", "low", "close", "volume"]].copy()
 
-    df["date"] = df.index.date
-    df["hour"] = df.index.hour
+    df["date"]        = df.index.date
+    df["hour"]        = df.index.hour
+    df["minute"]      = df.index.minute
+    df["time_bucket"] = df["hour"] * 60 + df["minute"]  # 0–1380
     return df
 
 
@@ -117,21 +124,43 @@ def load_data(symbol: str = "ES=F",
 # DAILY STATS
 # ──────────────────────────────────────────────────────────────────────────────
 
-def build_daily(df: pd.DataFrame) -> pd.DataFrame:
+RTH_OPEN_BUCKET  = 570   # 09:30 ET in minutes from midnight
+RTH_CLOSE_BUCKET = 960   # 16:00 ET
+
+
+def build_daily(df: pd.DataFrame,
+                open_bucket: int = RTH_OPEN_BUCKET) -> pd.DataFrame:
     """
-    Aggregate hourly bars to daily level.
-    daily_open  = open of the 00:00 NY bar (first bar at midnight).
-    daily_high  = max(high) over all bars that day.
-    daily_low   = min(low)  over all bars that day.
-    daily_close = last close of the day.
-    range       = daily_high - daily_low.
-    is_macro    = True if date is in MACRO_DATES.
+    Aggregate to daily level.
+
+    open_bucket controls which bar is used as the daily reference open:
+      - RTH_OPEN_BUCKET (570 = 09:30 ET)  ← default, best for noise-cone
+      - 0 (00:00 ET midnight)              ← original HOD/LOD analysis
+
+    For open_bucket=570: if no exact 9:30 bar, use the first bar at or after 9:30.
+
+    daily_high / daily_low / daily_close are always computed over the FULL day
+    (all available bars for that calendar date), so they represent the true
+    daily range regardless of which open is used.
     """
-    midnight = (
-        df[df["hour"] == 0]
-        .groupby("date")["open"]
-        .first()
-        .rename("daily_open")
+    # Find daily open price
+    if open_bucket == RTH_OPEN_BUCKET:
+        rth = df[df["time_bucket"] >= RTH_OPEN_BUCKET]
+        open_series = rth.groupby("date")["open"].first().rename("daily_open")
+    else:
+        open_series = (
+            df[df["time_bucket"] == open_bucket]
+            .groupby("date")["open"]
+            .first()
+            .rename("daily_open")
+        )
+
+    # RTH close (last bar at or before 16:00)
+    rth_close = (
+        df[df["time_bucket"] <= RTH_CLOSE_BUCKET]
+        .groupby("date")["close"]
+        .last()
+        .rename("rth_close")
     )
 
     ohlc = df.groupby("date").agg(
@@ -140,7 +169,7 @@ def build_daily(df: pd.DataFrame) -> pd.DataFrame:
         daily_close = ("close", "last"),
     )
 
-    daily = ohlc.join(midnight, how="inner")   # drop days without a 00:00 bar
+    daily = ohlc.join(open_series, how="inner").join(rth_close, how="left")
     daily["range"]    = daily["daily_high"] - daily["daily_low"]
     daily["is_macro"] = pd.Series(
         {d: d in MACRO_DATES for d in daily.index}, dtype=bool

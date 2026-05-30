@@ -26,7 +26,8 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from itertools import product
 
-from es_analysis import load_data, build_daily, add_atr, MACRO_DATES
+from es_analysis import (load_data, build_daily, add_atr, MACRO_DATES,
+                          RTH_OPEN_BUCKET, RTH_CLOSE_BUCKET)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -47,15 +48,24 @@ def build_cum_excursion(df: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
     for d, grp in df.groupby("date"):
         if d not in daily.index:
             continue
-        op = daily.loc[d, "daily_open"]
-        grp = grp.sort_index()
+        op  = daily.loc[d, "daily_open"]
+        cls = daily.loc[d, "rth_close"]   # forward return measured to RTH close
+        if pd.isna(op) or pd.isna(cls):
+            continue
+
+        # Only use RTH bars for the cone (9:30 AM → 4:00 PM)
+        grp = grp[(grp["time_bucket"] >= RTH_OPEN_BUCKET) &
+                  (grp["time_bucket"] <= RTH_CLOSE_BUCKET)].sort_index()
+        if grp.empty:
+            continue
+
         cum_up = ((grp["high"] - op) / op).cummax()
         cum_dn = ((op - grp["low"])  / op).cummax()
         tmp = grp.copy()
-        tmp["cum_up"] = cum_up.values
-        tmp["cum_dn"] = cum_dn.values
-        tmp["daily_open"] = op
-        tmp["daily_close"] = daily.loc[d, "daily_close"]
+        tmp["cum_up"]      = cum_up.values
+        tmp["cum_dn"]      = cum_dn.values
+        tmp["daily_open"]  = op
+        tmp["daily_close"] = cls
         rows.append(tmp)
 
     return pd.concat(rows).sort_index()
@@ -81,10 +91,11 @@ def build_cone(excursion_df: pd.DataFrame,
     Returns (cone_up_prices, cone_dn_prices) — both indexed by date, columns = hours.
     """
     # Pivot over ALL days so the index is complete
-    piv_up = (excursion_df.groupby(["date", "hour"])["cum_up"]
-              .mean().unstack("hour"))
-    piv_dn = (excursion_df.groupby(["date", "hour"])["cum_dn"]
-              .mean().unstack("hour"))
+    # Use time_bucket (minutes from midnight) as the column — works for any resolution
+    piv_up = (excursion_df.groupby(["date", "time_bucket"])["cum_up"]
+              .mean().unstack("time_bucket"))
+    piv_dn = (excursion_df.groupby(["date", "time_bucket"])["cum_dn"]
+              .mean().unstack("time_bucket"))
 
     # Mask macro days with NaN so they don't contribute to rolling mean
     if exclude_macro:
@@ -145,24 +156,24 @@ def find_breakouts(excursion_df: pd.DataFrame,
         triggered_up = triggered_dn = False
 
         for _, row in grp.iterrows():
-            h = int(row["hour"])
+            tb = int(row["time_bucket"])
 
             # UPSIDE breakout
-            if not triggered_up and h in cone_up.columns:
-                c_up = cone_up.loc[d, h]
+            if not triggered_up and tb in cone_up.columns:
+                c_up = cone_up.loc[d, tb]
                 if pd.notna(c_up) and row["high"] > c_up * threshold:
-                    fwd = (cls - row["close"]) / row["close"]  # positive = continued up
-                    records.append(dict(date=d, hour=h, direction="up",
+                    fwd = (cls - row["close"]) / row["close"]
+                    records.append(dict(date=d, time_bucket=tb, direction="up",
                                         bar_close=row["close"], daily_close=cls,
                                         fwd_return=fwd, cone_level=c_up))
                     triggered_up = True
 
             # DOWNSIDE breakout
-            if not triggered_dn and h in cone_dn.columns:
-                c_dn = cone_dn.loc[d, h]
+            if not triggered_dn and tb in cone_dn.columns:
+                c_dn = cone_dn.loc[d, tb]
                 if pd.notna(c_dn) and row["low"] < c_dn / threshold:
-                    fwd = (row["close"] - cls) / row["close"]  # positive = continued dn
-                    records.append(dict(date=d, hour=h, direction="dn",
+                    fwd = (row["close"] - cls) / row["close"]
+                    records.append(dict(date=d, time_bucket=tb, direction="dn",
                                         bar_close=row["close"], daily_close=cls,
                                         fwd_return=fwd, cone_level=c_dn))
                     triggered_dn = True
@@ -347,20 +358,20 @@ def plot_cone_day(excursion_df: pd.DataFrame,
             ax.set_visible(False)
             continue
         grp = excursion_df[excursion_df["date"] == d].sort_values("hour")
-        hours = grp["hour"].values
-        price = grp["close"].values
-        hi    = grp["high"].values
-        lo    = grp["low"].values
+        buckets = grp["time_bucket"].values
+        price   = grp["close"].values
+        hi      = grp["high"].values
+        lo      = grp["low"].values
 
-        up_vals = [cone_up.loc[d, h] if h in cone_up.columns else np.nan for h in hours]
-        dn_vals = [cone_dn.loc[d, h] if h in cone_dn.columns else np.nan for h in hours]
+        up_vals = [cone_up.loc[d, tb] if tb in cone_up.columns else np.nan for tb in buckets]
+        dn_vals = [cone_dn.loc[d, tb] if tb in cone_dn.columns else np.nan for tb in buckets]
 
-        ax.fill_between(hours, dn_vals, up_vals, alpha=0.15, color="blue", label="Cone")
-        ax.plot(hours, up_vals, "b--", lw=0.8)
-        ax.plot(hours, dn_vals, "b--", lw=0.8)
-        ax.plot(hours, price,   "k-",  lw=1.2, label="Close")
-        ax.plot(hours, hi,      "g.",  ms=3)
-        ax.plot(hours, lo,      "r.",  ms=3)
+        ax.fill_between(buckets, dn_vals, up_vals, alpha=0.15, color="blue", label="Cone")
+        ax.plot(buckets, up_vals, "b--", lw=0.8)
+        ax.plot(buckets, dn_vals, "b--", lw=0.8)
+        ax.plot(buckets, price,   "k-",  lw=1.2, label="Close")
+        ax.plot(buckets, hi,      "g.",  ms=3)
+        ax.plot(buckets, lo,      "r.",  ms=3)
         ax.set_title(str(d), fontsize=9)
         ax.grid(alpha=0.2)
         ax.legend(fontsize=7)
@@ -375,9 +386,10 @@ def plot_cone_day(excursion_df: pd.DataFrame,
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run(symbol: str = "ES=F",
-        period: str = "730d",
+        interval: str = "5m",
+        period: str = "60d",
         csv_path: str | None = None,
-        n_range: range = range(2, 61),
+        n_range: range = range(2, 31),
         thresholds: list[float] = None,
         exclude_macro: bool = True) -> dict:
 
@@ -385,8 +397,8 @@ def run(symbol: str = "ES=F",
         thresholds = [1.0, 1.01, 1.02, 1.05]
 
     print("── Loading data ──────────────────────────────────")
-    df = load_data(symbol=symbol, period=period, csv_path=csv_path)
-    print(f"  {len(df):,} hourly bars  |  {df['date'].min()} → {df['date'].max()}")
+    df = load_data(symbol=symbol, period=period, interval=interval, csv_path=csv_path)
+    print(f"  {len(df):,} bars ({interval})  |  {df['date'].min()} → {df['date'].max()}")
 
     print("── Building daily stats ──────────────────────────")
     daily = build_daily(df)
